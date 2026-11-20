@@ -1,0 +1,241 @@
+name: FamilyHub NuvioTV Sync & Release
+
+on:
+  schedule:
+    # Check upstream NuvioMedia/NuvioTV every 12 hours for new releases
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: Optional upstream release tag to build (defaults to latest release)
+        required: false
+        type: string
+        default: ""
+      include_prereleases:
+        description: Include upstream beta/prerelease tags when checking latest
+        required: false
+        type: boolean
+        default: false
+      force_rebuild:
+        description: Rebuild and overwrite APK assets even if release tag already exists on this fork
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: familyhub-nuviotv-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync-and-release:
+    name: Sync upstream & build FamilyHub release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPO: NuvioMedia/NuvioTV
+      RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+      RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+      RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+      RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+      LOCAL_PROPERTIES_BASE64: ${{ secrets.LOCAL_PROPERTIES_BASE64 }}
+
+    steps:
+      - name: Check out fork configuration & patch bundle
+        uses: actions/checkout@v4
+
+      - name: Resolve target upstream release
+        id: upstream
+        env:
+          INPUT_TAG: ${{ inputs.target_tag }}
+          INCLUDE_PRE: ${{ inputs.include_prereleases }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          python3 - << 'PYEOF' >> "${GITHUB_OUTPUT}"
+          import json, os, subprocess, sys
+
+          upstream_repo = os.environ["UPSTREAM_REPO"]
+          fork_repo = os.environ["GITHUB_REPOSITORY"]
+          input_tag = os.environ.get("INPUT_TAG", "").strip()
+          include_pre = os.environ.get("INCLUDE_PRE", "false").lower() == "true"
+          force_rebuild = os.environ.get("FORCE_REBUILD", "false").lower() == "true"
+
+          def gh_api(path):
+              out = subprocess.check_output(["gh", "api", path], text=True)
+              return json.loads(out)
+
+          if input_tag:
+              rel = gh_api(f"repos/{upstream_repo}/releases/tags/{input_tag}")
+          else:
+              releases = gh_api(f"repos/{upstream_repo}/releases?per_page=20")
+              candidates = [
+                  r for r in releases
+                  if not r.get("draft") and (include_pre or not r.get("prerelease"))
+              ]
+              if not candidates:
+                  print("No eligible upstream releases found.", file=sys.stderr)
+                  sys.exit(1)
+              rel = candidates[0]
+
+          tag = rel["tag_name"]
+          prerelease = "true" if rel.get("prerelease") else "false"
+          title = rel.get("name") or tag
+          html_url = rel.get("html_url") or f"https://github.com/{upstream_repo}/releases/tag/{tag}"
+
+          # Check if already published on fork
+          exists_proc = subprocess.run(
+              ["gh", "release", "view", tag, "--repo", fork_repo],
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL,
+          )
+          already_exists = exists_proc.returncode == 0
+          should_build = "true" if (force_rebuild or not already_exists) else "false"
+
+          print(f"tag={tag}")
+          print(f"prerelease={prerelease}")
+          print(f"title={title}")
+          print(f"html_url={html_url}")
+          print(f"already_exists={'true' if already_exists else 'false'}")
+          print(f"should_build={should_build}")
+          PYEOF
+
+      - name: Skip if already up to date
+        if: steps.upstream.outputs.should_build != 'true'
+        run: |
+          {
+            echo "### Already Up To Date"
+            echo "Upstream tag \`${{ steps.upstream.outputs.tag }}\` is already published on \`${{ github.repository }}\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Validate required secrets
+        if: steps.upstream.outputs.should_build == 'true'
+        run: |
+          required=(
+            RELEASE_KEYSTORE_BASE64
+            RELEASE_KEY_ALIAS
+            RELEASE_KEY_PASSWORD
+            RELEASE_STORE_PASSWORD
+            LOCAL_PROPERTIES_BASE64
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("${name}")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required GitHub secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Shallow clone upstream tag and apply FamilyHub patch
+        if: steps.upstream.outputs.should_build == 'true'
+        run: |
+          rm -rf upstream-src
+          git clone --depth 1 --branch "${{ steps.upstream.outputs.tag }}" \
+            "https://github.com/${UPSTREAM_REPO}.git" upstream-src
+          chmod +x familyhub/apply_patch.sh
+          ./familyhub/apply_patch.sh upstream-src
+          if ! grep -q "NUVIO_GITHUB_OWNER" upstream-src/app/build.gradle.kts; then
+            echo "ERROR: GITHUB_OWNER override missing after patch." >&2
+            exit 1
+          fi
+
+      - name: Set up Java 17
+        if: steps.upstream.outputs.should_build == 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        if: steps.upstream.outputs.should_build == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure release keystore and BuildConfig properties
+        if: steps.upstream.outputs.should_build == 'true'
+        run: |
+          keystore_path="${RUNNER_TEMP}/nuviotv-release.jks"
+          printf '%s' "${RELEASE_KEYSTORE_BASE64}" | base64 --decode > "${keystore_path}"
+          printf '%s' "${LOCAL_PROPERTIES_BASE64}" | base64 --decode > upstream-src/local.properties
+
+          set_property() {
+            local property_name="$1"
+            local property_value="$2"
+            [[ -n "${property_value}" ]] || return 0
+            sed -i -E "/^[[:space:]]*${property_name}[[:space:]]*=/d" upstream-src/local.properties
+            printf '\n%s=%s\n' "${property_name}" "${property_value}" >> upstream-src/local.properties
+          }
+
+          sed -i -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE|NUVIO_GITHUB_OWNER|NUVIO_GITHUB_REPO)[[:space:]]*=/d' upstream-src/local.properties
+          set_property NUVIO_RELEASE_STORE_FILE "${keystore_path}"
+          set_property NUVIO_RELEASE_KEY_ALIAS "${RELEASE_KEY_ALIAS}"
+          set_property NUVIO_RELEASE_KEY_PASSWORD "${RELEASE_KEY_PASSWORD}"
+          set_property NUVIO_RELEASE_STORE_PASSWORD "${RELEASE_STORE_PASSWORD}"
+          set_property NUVIO_GITHUB_OWNER "${{ github.repository_owner }}"
+          set_property NUVIO_GITHUB_REPO "${{ github.event.repository.name }}"
+
+      - name: Run FamilyHub & updater unit tests and build release APKs
+        if: steps.upstream.outputs.should_build == 'true'
+        working-directory: upstream-src
+        env:
+          NUVIO_GITHUB_OWNER: ${{ github.repository_owner }}
+          NUVIO_GITHUB_REPO: ${{ github.event.repository.name }}
+        run: |
+          ./gradlew \
+            :app:testFullReleaseUnitTest \
+            --tests 'com.nuvio.tv.core.profile.ExternalProfileSwitchTest' \
+            --tests 'com.nuvio.tv.updater.*' \
+            :app:assembleFullRelease \
+            --stacktrace
+
+      - name: Upload APK build artifacts
+        if: steps.upstream.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: familyhub-nuviotv-${{ steps.upstream.outputs.tag }}
+          path: upstream-src/app/build/outputs/apk/full/release/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release on fork
+        if: steps.upstream.outputs.should_build == 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          PRE: ${{ steps.upstream.outputs.prerelease }}
+          TITLE: ${{ steps.upstream.outputs.title }}
+          UPSTREAM_URL: ${{ steps.upstream.outputs.html_url }}
+          ALREADY_EXISTS: ${{ steps.upstream.outputs.already_exists }}
+        run: |
+          mapfile -t release_apks < <(find upstream-src/app/build/outputs/apk/full/release -maxdepth 1 -type f -name '*.apk' -print | sort)
+          if (( ${#release_apks[@]} == 0 )); then
+            echo "ERROR: No release APKs produced." >&2
+            exit 1
+          fi
+
+          cat > release-notes.md << EOF
+          FamilyHub auto-built fork of **${UPSTREAM_REPO} \`${TAG}\`** with automatic external profile switching (\`nuvio://profile/{id}\` + \`profileId\` intent extra) and in-app auto-updater pointed to \`${GITHUB_REPOSITORY}\`.
+
+          - **Upstream Release:** ${UPSTREAM_URL}
+          - **In-App Updater Source:** \`${GITHUB_REPOSITORY}\`
+          EOF
+
+          if [[ "${ALREADY_EXISTS}" == "true" ]]; then
+            gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${release_apks[@]}"
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --notes-file release-notes.md
+          else
+            args=(
+              "${TAG}"
+              --repo "${GITHUB_REPOSITORY}"
+              --target "${GITHUB_SHA}"
+              --title "${TITLE} (FamilyHub)"
+              --notes-file release-notes.md
+            )
+            if [[ "${PRE}" == "true" ]]; then
+              args+=(--prerelease)
+            else
+              args+=(--latest)
+            fi
+            gh release create "${args[@]}" "${release_apks[@]}"
+          fi

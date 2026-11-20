@@ -1,0 +1,214 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 3e774fa..7514a0e 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -177,8 +177,14 @@ android {
+         buildConfigField("String", "SENTRY_DSN", buildConfigString(sentryDsn))
+ 
+         // In-app updater (GitHub Releases)
+-        buildConfigField("String", "GITHUB_OWNER", "\"NuvioMedia\"")
+-        buildConfigField("String", "GITHUB_REPO", "\"NuvioTV\"")
++        val githubOwner = providers.environmentVariable("NUVIO_GITHUB_OWNER").orNull?.trim()?.takeIf { it.isNotBlank() }
++            ?: localProperties.getProperty("NUVIO_GITHUB_OWNER")?.trim()?.takeIf { it.isNotBlank() }
++            ?: "NuvioMedia"
++        val githubRepo = providers.environmentVariable("NUVIO_GITHUB_REPO").orNull?.trim()?.takeIf { it.isNotBlank() }
++            ?: localProperties.getProperty("NUVIO_GITHUB_REPO")?.trim()?.takeIf { it.isNotBlank() }
++            ?: "NuvioTV"
++        buildConfigField("String", "GITHUB_OWNER", buildConfigString(githubOwner))
++        buildConfigField("String", "GITHUB_REPO", buildConfigString(githubRepo))
+     }
+ 
+     flavorDimensions += "distribution"
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index 9b39c91..44b71d0 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -145,6 +145,8 @@ import com.nuvio.tv.core.deeplink.DeepLinkHandler
+ import com.nuvio.tv.core.deeplink.DeepLinkParser
+ import com.nuvio.tv.core.player.PlayerWindowBackdrop
+ import com.nuvio.tv.core.party.PartyRepository
++import com.nuvio.tv.core.profile.ExternalProfileRequest
++import com.nuvio.tv.core.profile.ExternalProfileSwitch
+ import com.nuvio.tv.core.profile.ProfileManager
+ import com.nuvio.tv.core.sync.ProfileSyncService
+ import com.nuvio.tv.core.sync.StartupSyncService
+@@ -215,8 +217,10 @@ import javax.inject.Inject
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.withTimeoutOrNull
+ 
+ val LocalSidebarExpanded = compositionLocalOf { false }
+ val LocalContentFocusRequester = compositionLocalOf { FocusRequester.Default }
+@@ -330,6 +334,8 @@ open class MainActivity : ComponentActivity() {
+ 
+     private val pendingDeepLinkUrl = MutableStateFlow<String?>(null)
+     private val pendingLaunchIntent = MutableStateFlow<Intent?>(null)
++    private var externalProfileSeq = 0L
++    private val pendingExternalProfileRequest = MutableStateFlow<ExternalProfileRequest?>(null)
+ 
+     private lateinit var jankStats: JankStats
+ 
+@@ -392,6 +398,7 @@ open class MainActivity : ComponentActivity() {
+         val launchEpisode = intent?.getIntExtra("episode", -1)?.takeIf { it >= 0 }
+         val launchEpisodeTitle = intent?.getStringExtra("episodeTitle")
+         captureDeepLinkIntent(intent)
++        captureExternalProfileIntent(intent)
+ 
+         setContent {
+             var hasSelectedProfileThisSession by rememberSaveable { mutableStateOf(false) }
+@@ -436,6 +443,8 @@ open class MainActivity : ComponentActivity() {
+             }
+ 
+             val activeProfileId by profileManager.activeProfileId.collectAsState()
++            val activeProfileReady by profileManager.activeProfileReady.collectAsState()
++            val externalProfileRequest by pendingExternalProfileRequest.collectAsState()
+             val startupSplashEnabled by profileManager.startupSplashEnabled.collectAsState()
+             val startupLoadingState = remember(activeProfileId, startupSession) { StartupLoadingState() }
+             val profiles by profileManager.profiles.collectAsState()
+@@ -463,7 +472,8 @@ open class MainActivity : ComponentActivity() {
+             var profileSwitchedManually by remember { mutableStateOf(false) }
+             val shouldAutoSelectProfile = rememberLastProfileEnabled &&
+                 hasEverSelectedProfile && !activeProfileHasPin &&
+-                !hasSelectedProfileThisSession && !profileSwitchedManually
++                !hasSelectedProfileThisSession && !profileSwitchedManually &&
++                externalProfileRequest == null
+             if (shouldAutoSelectProfile && !splashTriggered) {
+                 splashTriggered = true
+                 hasSelectedProfileThisSession = true
+@@ -479,6 +489,64 @@ open class MainActivity : ComponentActivity() {
+                     }
+                 }
+             }
++            LaunchedEffect(
++                externalProfileRequest,
++                hasSeenAuthQrOnFirstLaunch,
++                authState,
++                activeProfileReady,
++                profiles,
++                activeProfileId,
++                profilePinStates
++            ) {
++                val req = externalProfileRequest ?: return@LaunchedEffect
++                val authReady = hasSeenAuthQrOnFirstLaunch != null && authState !is AuthState.Loading
++                if (!authReady || !activeProfileReady) return@LaunchedEffect
++                if (hasSeenAuthQrOnFirstLaunch == false &&
++                    authState !is AuthState.FullAccount &&
++                    !onboardingCompletedThisSession
++                ) {
++                    pendingExternalProfileRequest.value = null
++                    return@LaunchedEffect
++                }
++
++                val targetProfile = profiles.firstOrNull { it.id == req.profileId }
++                    ?: withTimeoutOrNull(300L) {
++                        profileManager.profiles.first { list -> list.any { it.id == req.profileId } }
++                    }?.firstOrNull { it.id == req.profileId }
++                if (targetProfile == null) {
++                    pendingExternalProfileRequest.value = null
++                    return@LaunchedEffect
++                }
++
++                if (profilePinStates[targetProfile.id] == true) {
++                    hasSelectedProfileThisSession = false
++                    splashTriggered = false
++                    pendingExternalProfileRequest.value = null
++                    return@LaunchedEffect
++                }
++
++                val profileChanged = activeProfileId != targetProfile.id
++                if (profileChanged) {
++                    profileManager.setActiveProfile(targetProfile.id)
++                    withTimeoutOrNull(1_000L) {
++                        profileManager.activeProfileId.first { it == targetProfile.id }
++                    }
++                    startupSession++
++                    focusedSplashColor = null
++                    focusedSplashBgUrl = null
++                    focusedSplashCacheKey = null
++                    focusedSplashTheme = null
++                }
++                splashTriggered = true
++                hasSelectedProfileThisSession = true
++                pendingExternalProfileRequest.value = null
++                if (authManager.authState.value is AuthState.FullAccount) {
++                    startupSyncService.requestSyncNow()
++                }
++                targetProfile.profileBackgroundId?.let { bgId ->
++                    profileBackgroundRepository.loadSelectedAndPreload(bgId)
++                }
++            }
+ 
+             var avatarCatalog by remember { mutableStateOf(emptyList<com.nuvio.tv.data.remote.supabase.AvatarCatalogItem>()) }
+             val avatarMemberAccess by memberAccessRepository.access.collectAsState()
+@@ -737,9 +805,14 @@ open class MainActivity : ComponentActivity() {
+                     var startupDestination = StartupDestination.Loading
+                     val surfaceContentReady = hasSeenAuthQrOnFirstLaunch != null &&
+                         authState !is AuthState.Loading
++                    val waitingForExternalProfile = externalProfileRequest != null && (
++                        !activeProfileReady ||
++                            activeProfileId != externalProfileRequest?.profileId ||
++                            !hasSelectedProfileThisSession
++                        )
+ 
+-                    if (!surfaceContentReady) {
+-                        // Still loading auth state; nothing to show yet.
++                    if (!surfaceContentReady || waitingForExternalProfile) {
++                        // Still loading auth state or switching to requested external profile.
+                     } else if (
+                         hasSeenAuthQrOnFirstLaunch == false &&
+                         authState !is AuthState.FullAccount &&
+@@ -818,6 +891,7 @@ open class MainActivity : ComponentActivity() {
+                             }
+                         )
+                     } else {
++                    key(activeProfileId, startupSession) {
+ 
+                     val layoutChosen = mainUiPrefs.hasChosenLayout
+                     val prefsLoading = layoutChosen == null || !mainUiPrefs.experienceModeLoaded || installedAddons == null
+@@ -1233,9 +1307,10 @@ open class MainActivity : ComponentActivity() {
+                             )
+                         }
+                     }
+-                } 
+-            } 
+-        } 
++                }
++                }
++            }
++        }
+     }
+ 
+                     LaunchedEffect(startupDestination, startupLoadingState) {
+@@ -1313,10 +1388,12 @@ open class MainActivity : ComponentActivity() {
+         setIntent(intent)
+         captureDeepLinkIntent(intent)
+         captureLaunchIntent(intent)
++        captureExternalProfileIntent(intent)
+     }
+ 
+     private fun captureDeepLinkIntent(intent: Intent?) {
+         val url = intent?.dataString?.trim()?.takeIf(String::isNotBlank) ?: return
++        if (ExternalProfileSwitch.isProfileOnlyDeepLink(url)) return
+         pendingDeepLinkUrl.value = url
+     }
+ 
+@@ -1327,6 +1404,15 @@ open class MainActivity : ComponentActivity() {
+         pendingLaunchIntent.value = intent
+     }
+ 
++    private fun captureExternalProfileIntent(intent: Intent?) {
++        val targetProfileId = ExternalProfileSwitch.extractProfileId(intent) ?: return
++        externalProfileSeq += 1L
++        pendingExternalProfileRequest.value = ExternalProfileRequest(
++            profileId = targetProfileId,
++            sequence = externalProfileSeq
++        )
++    }
++
+     override fun onPause() {
+         super.onPause()
+         if (::jankStats.isInitialized) jankStats.isTrackingEnabled = false

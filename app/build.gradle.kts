@@ -177,8 +177,14 @@ android {
         buildConfigField("String", "SENTRY_DSN", buildConfigString(sentryDsn))
 
         // In-app updater (GitHub Releases)
-        buildConfigField("String", "GITHUB_OWNER", "\"NuvioMedia\"")
-        buildConfigField("String", "GITHUB_REPO", "\"NuvioTV\"")
+        val githubOwner = providers.environmentVariable("NUVIO_GITHUB_OWNER").orNull?.trim()?.takeIf { it.isNotBlank() }
+            ?: localProperties.getProperty("NUVIO_GITHUB_OWNER")?.trim()?.takeIf { it.isNotBlank() }
+            ?: "NuvioMedia"
+        val githubRepo = providers.environmentVariable("NUVIO_GITHUB_REPO").orNull?.trim()?.takeIf { it.isNotBlank() }
+            ?: localProperties.getProperty("NUVIO_GITHUB_REPO")?.trim()?.takeIf { it.isNotBlank() }
+            ?: "NuvioTV"
+        buildConfigField("String", "GITHUB_OWNER", buildConfigString(githubOwner))
+        buildConfigField("String", "GITHUB_REPO", buildConfigString(githubRepo))
     }
 
     flavorDimensions += "distribution"
