@@ -403,10 +403,18 @@ index ae332a8..9ce2cbd 100644
      }
      data object Player : Screen("player/{streamUrl}/{title}?streamName={streamName}&year={year}&headers={headers}&contentId={contentId}&contentType={contentType}&contentName={contentName}&poster={poster}&backdrop={backdrop}&logo={logo}&videoId={videoId}&season={season}&episode={episode}&episodeTitle={episodeTitle}&bingeGroup={bingeGroup}&autoPlayNav={autoPlayNav}&returnToDetailOnBack={returnToDetailOnBack}&returnToHomeOnBack={returnToHomeOnBack}&filename={filename}&videoHash={videoHash}&videoSize={videoSize}&startFromBeginning={startFromBeginning}&addonName={addonName}&addonLogo={addonLogo}&streamDescription={streamDescription}&infoHash={infoHash}&fileIdx={fileIdx}&sources={sources}&contentLanguage={contentLanguage}&cloudSessionToken={cloudSessionToken}&launchStartedAtMs={launchStartedAtMs}&profileId={profileId}&audioDelayMs={audioDelayMs}&audioDelayLanguage={audioDelayLanguage}") {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
-index 3d3eefb..132cc2e 100644
+index 3d3eefb..1745d5d 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
-@@ -150,6 +150,12 @@ class StreamScreenViewModel @Inject constructor(
+@@ -30,6 +30,7 @@ import com.nuvio.tv.data.local.PlayerPreference
+ import com.nuvio.tv.data.local.PlayerSettings
+ import com.nuvio.tv.data.local.PlayerSettingsDataStore
+ import com.nuvio.tv.data.local.StreamAutoPlayMode
++import com.nuvio.tv.data.local.StreamAutoPlaySource
+ import com.nuvio.tv.data.local.StreamBadgeSettingsDataStore
+ import com.nuvio.tv.data.local.StreamLinkCacheDataStore
+ import com.nuvio.tv.data.local.BingeGroupCacheDataStore
+@@ -150,6 +151,12 @@ class StreamScreenViewModel @Inject constructor(
      private val manualSelection: Boolean = savedStateHandle.get<String>("manualSelection")
          ?.toBooleanStrictOrNull()
          ?: false
@@ -419,7 +427,7 @@ index 3d3eefb..132cc2e 100644
      private val streamCacheKey: String = "${contentType.lowercase()}|$videoId"
      private val partyKey: String = com.nuvio.tv.core.party.partyMediaKey(
          metaType = contentType,
-@@ -407,14 +413,32 @@ class StreamScreenViewModel @Inject constructor(
+@@ -407,14 +414,32 @@ class StreamScreenViewModel @Inject constructor(
          streamLoadJob = newScope.launch {
              streamLoadCompleted = false
              val playerSettings = playerSettingsDataStore.playerSettings.first()
@@ -453,7 +461,7 @@ index 3d3eefb..132cc2e 100644
                  )
                  // In MANUAL mode, still enable direct auto-play if a persisted
                  // binge group exists - same behavior as playNextEpisode in the player.
-@@ -431,7 +455,8 @@ class StreamScreenViewModel @Inject constructor(
+@@ -431,7 +456,8 @@ class StreamScreenViewModel @Inject constructor(
              }
  
              if (
@@ -463,7 +471,7 @@ index 3d3eefb..132cc2e 100644
                  !StreamAutoPlayPolicy.isRegexSelectionConfigured(playerSettings.streamAutoPlayRegex)
              ) {
                  directAutoPlayFlowEnabledForSession = false
-@@ -530,6 +555,22 @@ class StreamScreenViewModel @Inject constructor(
+@@ -530,6 +556,22 @@ class StreamScreenViewModel @Inject constructor(
                  addonRepository.getInstalledAddons().first().enabledAddons()
              }
              val installedAddonOrder = installedAddons.map { it.displayName }
@@ -486,7 +494,7 @@ index 3d3eefb..132cc2e 100644
              val directDebridSourceNames = emptyList<String>()
              val directDebridAvailable = false
              val persistedBingeGroup = if (playerSettings.streamAutoPlayPreferBingeGroupForNextEpisode &&
-@@ -547,7 +588,7 @@ class StreamScreenViewModel @Inject constructor(
+@@ -547,7 +589,7 @@ class StreamScreenViewModel @Inject constructor(
                  val orderedAddonStreams = StreamAutoPlaySelector.orderAddonStreams(
                      addonStreamGroups,
                      installedAddonOrder,
@@ -495,7 +503,7 @@ index 3d3eefb..132cc2e 100644
                  )
  
                  // Preserve badges already computed by prior badge jobs so they
-@@ -620,11 +661,11 @@ class StreamScreenViewModel @Inject constructor(
+@@ -620,11 +662,11 @@ class StreamScreenViewModel @Inject constructor(
                      // Fall back to binge group alone
                      bingeAndFilename ?: bingeAndInfoHash ?: StreamAutoPlaySelector.selectAutoPlayStream(
                          streams = allStreams,
@@ -510,7 +518,7 @@ index 3d3eefb..132cc2e 100644
                          selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
                          preferredBingeGroup = persistedBingeGroup,
                          preferBingeGroupInSelection = true,
-@@ -644,14 +685,16 @@ class StreamScreenViewModel @Inject constructor(
+@@ -644,14 +686,16 @@ class StreamScreenViewModel @Inject constructor(
                  } else {
                      StreamAutoPlaySelector.selectAutoPlayStream(
                          streams = allStreams,
@@ -531,7 +539,7 @@ index 3d3eefb..132cc2e 100644
                      )
                  }
                  if (selectedAutoPlayStream != null) {
-@@ -843,16 +886,16 @@ class StreamScreenViewModel @Inject constructor(
+@@ -843,16 +887,16 @@ class StreamScreenViewModel @Inject constructor(
                                  // match is found we can start playback immediately
                                  // without waiting for the full timeout.
                                  val orderedStreams = StreamAutoPlaySelector.orderAddonStreams(
@@ -552,7 +560,7 @@ index 3d3eefb..132cc2e 100644
                                      selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
                                      preferredBingeGroup = persistedBingeGroup,
                                      preferBingeGroupInSelection = true,
-@@ -869,6 +912,28 @@ class StreamScreenViewModel @Inject constructor(
+@@ -869,6 +913,28 @@ class StreamScreenViewModel @Inject constructor(
                                      }
                                  }
                              }
