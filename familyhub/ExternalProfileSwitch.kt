@@ -12,6 +12,8 @@ data class ExternalProfileRequest(
 object ExternalProfileSwitch {
     const val EXTRA_PROFILE_ID = "profileId"
     private const val EXTRA_PROFILE_ID_SNAKE = "profile_id"
+    const val EXTRA_AUTO_PLAY_FIRST = "autoPlayFirst"
+    const val EXTRA_PREFER_ADDON = "preferAddon"
 
     fun extractProfileId(intent: Intent?): Int? {
         if (intent == null) return null
@@ -27,6 +29,28 @@ object ExternalProfileSwitch {
 
         return extractProfileIdFromUrl(intent.dataString)
     }
+
+    fun extractAutoPlayFirst(intent: Intent?): Boolean {
+        val extras = intent?.extras ?: return false
+        @Suppress("DEPRECATION")
+        return parseAutoPlayFirstValue(extras.get(EXTRA_AUTO_PLAY_FIRST))
+    }
+
+    fun extractPreferAddon(intent: Intent?): String? {
+        val extras = intent?.extras ?: return null
+        @Suppress("DEPRECATION")
+        return parsePreferAddonValue(extras.get(EXTRA_PREFER_ADDON))
+    }
+
+    internal fun parseAutoPlayFirstValue(raw: Any?): Boolean = when (raw) {
+        is Boolean -> raw
+        is String -> raw.trim().equals("true", ignoreCase = true) || raw.trim() == "1"
+        is Int -> raw != 0
+        else -> false
+    }
+
+    internal fun parsePreferAddonValue(raw: Any?): String? =
+        (raw as? String)?.trim()?.takeIf(String::isNotEmpty)
 
     fun extractProfileIdFromUrl(rawUrl: String?): Int? {
         val trimmed = rawUrl?.trim()?.takeIf(String::isNotEmpty) ?: return null
