@@ -347,6 +347,440 @@ index 0079104..65fda88 100644
              StreamAutoPlayMode.REGEX_MATCH -> {
                  val pattern = regexPattern.trim()
  
+diff --git a/app/src/main/java/com/nuvio/tv/core/recommendations/ProgramBuilder.kt b/app/src/main/java/com/nuvio/tv/core/recommendations/ProgramBuilder.kt
+index 99691be..c9180a0 100644
+--- a/app/src/main/java/com/nuvio/tv/core/recommendations/ProgramBuilder.kt
++++ b/app/src/main/java/com/nuvio/tv/core/recommendations/ProgramBuilder.kt
+@@ -6,6 +6,7 @@ import android.net.Uri
+ import androidx.tvprovider.media.tv.TvContractCompat
+ import androidx.tvprovider.media.tv.WatchNextProgram
+ import com.nuvio.tv.MainActivity
++import com.nuvio.tv.core.profile.ExternalProfileSwitch
+ import com.nuvio.tv.domain.model.WatchProgress
+ import dagger.hilt.android.qualifiers.ApplicationContext
+ import javax.inject.Inject
+@@ -22,7 +23,7 @@ class ProgramBuilder @Inject constructor(
+         else
+             "wn_${progress.contentId}"
+ 
+-    fun buildWatchNextProgram(progress: WatchProgress): WatchNextProgram {
++    fun buildWatchNextProgram(progress: WatchProgress, profileId: Int? = null): WatchNextProgram {
+         val isMovie = progress.contentType == "movie"
+         val programType = if (isMovie) {
+             TvContractCompat.WatchNextPrograms.TYPE_MOVIE
+@@ -36,7 +37,7 @@ class ProgramBuilder @Inject constructor(
+             .setTitle(progress.name)
+             .setLastEngagementTimeUtcMillis(progress.lastWatched)
+             .setInternalProviderId(watchNextId(progress))
+-            .setIntentUri(buildPlayUri(progress))
++            .setIntentUri(buildPlayUri(progress, profileId))
+ 
+         builder.setPosterArtAspectRatio(TvContractCompat.PreviewPrograms.ASPECT_RATIO_16_9)
+ 
+@@ -222,7 +223,7 @@ class ProgramBuilder @Inject constructor(
+         }
+     }
+ 
+-    private fun buildPlayUri(progress: WatchProgress): Uri =
++    private fun buildPlayUri(progress: WatchProgress, profileId: Int? = null): Uri =
+         Uri.parse(
+             Intent(context, MainActivity::class.java).apply {
+                 action = Intent.ACTION_VIEW
+@@ -237,6 +238,9 @@ class ProgramBuilder @Inject constructor(
+                 progress.episode?.let { putExtra("episode", it) }
+                 progress.episodeTitle?.let { putExtra("episodeTitle", it) }
+                 putExtra("launchMode", "stream")
++                if (profileId != null) {
++                    putExtra(ExternalProfileSwitch.EXTRA_PROFILE_ID, profileId)
++                }
+                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+             }.toUri(Intent.URI_INTENT_SCHEME)
+         )
+diff --git a/app/src/main/java/com/nuvio/tv/core/recommendations/TvRecommendationManager.kt b/app/src/main/java/com/nuvio/tv/core/recommendations/TvRecommendationManager.kt
+index 99365bb..571ee09 100644
+--- a/app/src/main/java/com/nuvio/tv/core/recommendations/TvRecommendationManager.kt
++++ b/app/src/main/java/com/nuvio/tv/core/recommendations/TvRecommendationManager.kt
+@@ -6,6 +6,7 @@ import android.util.Log
+ import com.nuvio.tv.core.poster.CustomPosterScreen
+ import com.nuvio.tv.core.poster.patternForScreen
+ import com.nuvio.tv.core.poster.withCustomPosterArt
++import com.nuvio.tv.core.profile.ProfileManager
+ import com.nuvio.tv.data.local.LayoutPreferenceDataStore
+ import com.nuvio.tv.domain.model.WatchProgress
+ import com.nuvio.tv.ui.screens.home.ContinueWatchingItem
+@@ -29,16 +30,23 @@ import kotlin.math.abs
+ class TvRecommendationManager @Inject constructor(
+     @ApplicationContext private val context: Context,
+     private val programBuilder: ProgramBuilder,
+-    private val layoutPreferenceDataStore: LayoutPreferenceDataStore
++    private val layoutPreferenceDataStore: LayoutPreferenceDataStore,
++    private val profileManager: ProfileManager
+ ) {
+ 
+     private val mutex = Mutex()
+     private val syncedFingerprints = ConcurrentHashMap<String, ProgramFingerprint>()
+     private val deferScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    @Volatile private var lastSyncedProfileId: Int? = null
++
++    private data class PendingWatchNext(
++        val progress: WatchProgress,
++        val profileId: Int
++    )
+ 
+     // Latest progress seen while frames are on screen. Leanback IPC is deferred until playback
+     // stops so the provider write does not hitch the player, and so the position is not dropped.
+-    private var pendingWatchNext: WatchProgress? = null
++    private var pendingWatchNext: PendingWatchNext? = null
+ 
+     init {
+         deferScope.launch {
+@@ -49,6 +57,7 @@ class TvRecommendationManager @Inject constructor(
+     }
+ 
+     private data class ProgramFingerprint(
++        val profileId: Int,
+         val title: String?,
+         val position: Long,
+         val duration: Long,
+@@ -87,11 +96,17 @@ class TvRecommendationManager @Inject constructor(
+         updateWatchNext(progressList)
+     }
+ 
+-    suspend fun updateWatchNext(items: List<WatchProgress>) {
++    suspend fun updateWatchNext(
++        items: List<WatchProgress>,
++        profileId: Int = profileManager.activeProfileId.value
++    ) {
+         if (!isTvDevice()) return
+         mutex.withLock {
+             withContext(Dispatchers.IO) {
+                 try {
++                    if (lastSyncedProfileId != null && lastSyncedProfileId != profileId) {
++                        syncedFingerprints.clear()
++                    }
+                     val posterPattern = recommendationPosterPattern()
+                     val decorated = items.withCustomPosterArt(posterPattern)
+                     val currentInternalIds = decorated.map { programBuilder.watchNextId(it) }.toSet()
+@@ -107,6 +122,7 @@ class TvRecommendationManager @Inject constructor(
+                     decorated.forEach { p ->
+                         val id = programBuilder.watchNextId(p)
+                         val newFingerprint = ProgramFingerprint(
++                            profileId = profileId,
+                             title = p.name,
+                             position = p.position,
+                             duration = p.duration,
+@@ -117,6 +133,7 @@ class TvRecommendationManager @Inject constructor(
+                         )
+                         val oldFingerprint = syncedFingerprints[id]
+                         if (oldFingerprint != null &&
++                            oldFingerprint.profileId == newFingerprint.profileId &&
+                             oldFingerprint.title == newFingerprint.title &&
+                             oldFingerprint.poster == newFingerprint.poster &&
+                             oldFingerprint.backdrop == newFingerprint.backdrop &&
+@@ -129,10 +146,11 @@ class TvRecommendationManager @Inject constructor(
+                             return@forEach
+                         }
+ 
+-                        val program = programBuilder.buildWatchNextProgram(p)
++                        val program = programBuilder.buildWatchNextProgram(p, profileId)
+                         programBuilder.upsertWatchNextProgram(program, id)
+                         syncedFingerprints[id] = newFingerprint
+                     }
++                    lastSyncedProfileId = profileId
+                 } catch (e: Exception) {
+                     Log.w(TAG, "updateWatchNext failed", e)
+                 }
+@@ -140,13 +158,16 @@ class TvRecommendationManager @Inject constructor(
+         }
+     }
+ 
+-    suspend fun updateSingleWatchNextProgram(progress: WatchProgress) {
++    suspend fun updateSingleWatchNextProgram(
++        progress: WatchProgress,
++        profileId: Int = profileManager.activeProfileId.value
++    ) {
+         if (!isTvDevice()) return
+         mutex.withLock {
+-            pendingWatchNext = progress
++            pendingWatchNext = PendingWatchNext(progress, profileId)
+             if (isPlaybackActive.value) return@withLock
+             pendingWatchNext = null
+-            upsertSingleWatchNextLocked(progress)
++            upsertSingleWatchNextLocked(progress, profileId)
+         }
+     }
+ 
+@@ -154,22 +175,27 @@ class TvRecommendationManager @Inject constructor(
+         if (!isTvDevice()) return
+         mutex.withLock {
+             if (isPlaybackActive.value) return@withLock
+-            val progress = pendingWatchNext ?: return@withLock
++            val pending = pendingWatchNext ?: return@withLock
+             pendingWatchNext = null
+-            upsertSingleWatchNextLocked(progress)
++            if (profileManager.activeProfileId.value != pending.profileId) return@withLock
++            upsertSingleWatchNextLocked(pending.progress, pending.profileId)
+         }
+     }
+ 
+-    private suspend fun upsertSingleWatchNextLocked(progress: WatchProgress) {
++    private suspend fun upsertSingleWatchNextLocked(progress: WatchProgress, profileId: Int) {
+         withContext(Dispatchers.IO) {
+             if (isPlaybackActive.value) {
+-                pendingWatchNext = progress
++                pendingWatchNext = PendingWatchNext(progress, profileId)
+                 return@withContext
+             }
+             try {
++                if (lastSyncedProfileId != null && lastSyncedProfileId != profileId) {
++                    syncedFingerprints.clear()
++                }
+                 val decorated = progress.withCustomPosterArt(recommendationPosterPattern())
+                 val id = programBuilder.watchNextId(decorated)
+                 val newFingerprint = ProgramFingerprint(
++                    profileId = profileId,
+                     title = decorated.name,
+                     position = decorated.position,
+                     duration = decorated.duration,
+@@ -180,6 +206,7 @@ class TvRecommendationManager @Inject constructor(
+                 )
+                 val oldFingerprint = syncedFingerprints[id]
+                 if (oldFingerprint != null &&
++                    oldFingerprint.profileId == newFingerprint.profileId &&
+                     oldFingerprint.title == newFingerprint.title &&
+                     oldFingerprint.poster == newFingerprint.poster &&
+                     oldFingerprint.backdrop == newFingerprint.backdrop &&
+@@ -191,9 +218,10 @@ class TvRecommendationManager @Inject constructor(
+                     return@withContext
+                 }
+ 
+-                val program = programBuilder.buildWatchNextProgram(decorated)
++                val program = programBuilder.buildWatchNextProgram(decorated, profileId)
+                 programBuilder.upsertWatchNextProgram(program, id)
+                 syncedFingerprints[id] = newFingerprint
++                lastSyncedProfileId = profileId
+             } catch (e: Exception) {
+                 Log.w(TAG, "updateSingleWatchNextProgram failed", e)
+             }
+@@ -210,7 +238,7 @@ class TvRecommendationManager @Inject constructor(
+         if (!isTvDevice()) return
+         mutex.withLock {
+             pendingWatchNext?.let { pending ->
+-                if (watchNextIdMatchesContentId(programBuilder.watchNextId(pending), contentId)) {
++                if (watchNextIdMatchesContentId(programBuilder.watchNextId(pending.progress), contentId)) {
+                     pendingWatchNext = null
+                 }
+             }
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelManager.kt b/app/src/main/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelManager.kt
+index 980d2f3..fa4cae7 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelManager.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelManager.kt
+@@ -13,6 +13,7 @@ import androidx.tvprovider.media.tv.PreviewProgram
+ import androidx.tvprovider.media.tv.TvContractCompat
+ import com.nuvio.tv.MainActivity
+ import com.nuvio.tv.R
++import com.nuvio.tv.core.profile.ExternalProfileSwitch
+ import com.nuvio.tv.domain.model.WatchProgress
+ import dagger.hilt.android.qualifiers.ApplicationContext
+ import kotlinx.coroutines.Dispatchers
+@@ -31,8 +32,10 @@ class AndroidTvChannelManager @Inject constructor(
+     private val prefs: TvChannelPreferences,
+ ) {
+     private val syncedProgramFingerprints = ConcurrentHashMap<String, ChannelProgramFingerprint>()
++    @Volatile private var lastSyncedProfileId: Int? = null
+ 
+     private data class ChannelProgramFingerprint(
++        val profileId: Int?,
+         val title: String?,
+         val position: Int?,
+         val duration: Int?,
+@@ -125,9 +128,12 @@ class AndroidTvChannelManager @Inject constructor(
+      * Syncs [items] to the Continue Watching channel: upserts present items and
+      * removes rows that are no longer in the list (completed or dismissed).
+      */
+-    suspend fun reconcile(items: List<WatchProgress>) = withContext(Dispatchers.IO) {
++    suspend fun reconcile(items: List<WatchProgress>, profileId: Int? = null) = withContext(Dispatchers.IO) {
+         if (!isSupported()) return@withContext
+         runCatching {
++            if (profileId != null && lastSyncedProfileId != null && lastSyncedProfileId != profileId) {
++                syncedProgramFingerprints.clear()
++            }
+             val channelId = ensureChannel() ?: return@runCatching
+             val existing = queryExistingPrograms(channelId)
+             val desiredKeys = items.map { progressKey(it) }.toSet()
+@@ -160,6 +166,7 @@ class AndroidTvChannelManager @Inject constructor(
+                 }
+ 
+                 val newFingerprint = ChannelProgramFingerprint(
++                    profileId = profileId,
+                     title = progress.name,
+                     position = positionMs,
+                     duration = progress.duration.toInt(),
+@@ -173,6 +180,7 @@ class AndroidTvChannelManager @Inject constructor(
+                 val oldFingerprint = syncedProgramFingerprints[key]
+ 
+                 if (!rowIds.isNullOrEmpty() && oldFingerprint != null &&
++                    oldFingerprint.profileId == newFingerprint.profileId &&
+                     oldFingerprint.title == newFingerprint.title &&
+                     oldFingerprint.imageUri == newFingerprint.imageUri &&
+                     oldFingerprint.logoUri == newFingerprint.logoUri &&
+@@ -186,7 +194,7 @@ class AndroidTvChannelManager @Inject constructor(
+                     return@forEachIndexed
+                 }
+ 
+-                val values = buildProgramValues(progress, channelId, index, key)
++                val values = buildProgramValues(progress, channelId, index, key, profileId)
+                 if (!rowIds.isNullOrEmpty()) {
+                     val primaryRowId = rowIds.first()
+                     // UPDATE the existing program row in place — keeping its row ID stable.
+@@ -210,6 +218,9 @@ class AndroidTvChannelManager @Inject constructor(
+                 syncedProgramFingerprints[key] = newFingerprint
+                 Log.d(TAG, "${if (!rowIds.isNullOrEmpty()) "Updated" else "Inserted"} program key=$key pos=${values.getAsInteger("last_playback_position_millis")} dur=${values.getAsInteger("duration_millis")} pct=${progress.progressPercent}")
+             }
++            if (profileId != null) {
++                lastSyncedProfileId = profileId
++            }
+         }.onFailure { Log.w(TAG, "reconcile failed", it) }
+     }
+ 
+@@ -263,7 +274,8 @@ class AndroidTvChannelManager @Inject constructor(
+         progress: WatchProgress,
+         channelId: Long,
+         sortOrder: Int,
+-        key: String
++        key: String,
++        profileId: Int? = null
+     ): ContentValues {
+         val intentUri = Uri.parse(
+             Intent(context, MainActivity::class.java).apply {
+@@ -279,6 +291,9 @@ class AndroidTvChannelManager @Inject constructor(
+                 progress.episode?.let { putExtra("episode", it) }
+                 progress.episodeTitle?.let { putExtra("episodeTitle", it) }
+                 putExtra("launchMode", "stream")
++                if (profileId != null) {
++                    putExtra(ExternalProfileSwitch.EXTRA_PROFILE_ID, profileId)
++                }
+                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+             }.toUri(Intent.URI_INTENT_SCHEME)
+         )
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelSyncService.kt b/app/src/main/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelSyncService.kt
+index 52fa8c3..b310bbe 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelSyncService.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelSyncService.kt
+@@ -5,6 +5,7 @@ import android.util.Log
+ import com.nuvio.tv.core.poster.CustomPosterScreen
+ import com.nuvio.tv.core.poster.patternForScreen
+ import com.nuvio.tv.core.poster.withCustomPosterArt
++import com.nuvio.tv.core.profile.ProfileManager
+ import com.nuvio.tv.core.recommendations.TvRecommendationManager
+ import com.nuvio.tv.data.local.CachedInProgressItem
+ import com.nuvio.tv.data.local.CachedNextUpItem
+@@ -48,7 +49,8 @@ class AndroidTvChannelSyncService @Inject constructor(
+     private val cwEnrichmentCache: ContinueWatchingEnrichmentCache,
+     private val layoutPreferenceDataStore: LayoutPreferenceDataStore,
+     private val traktSettingsDataStore: TraktSettingsDataStore,
+-    private val tvRecommendationManager: TvRecommendationManager
++    private val tvRecommendationManager: TvRecommendationManager,
++    private val profileManager: ProfileManager
+ ) {
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+ 
+@@ -107,6 +109,7 @@ class AndroidTvChannelSyncService @Inject constructor(
+      * Called both from the live observer and from [TvChannelRefreshJobService].
+      */
+     suspend fun reconcileFromCache(settings: ChannelSettingsSnapshot? = null) {
++        val profileId = profileManager.activeProfileId.value
+         val resolvedSettings = settings ?: run {
+             val daysCap = traktSettingsDataStore.continueWatchingDaysCap.first()
+             val dismissed = traktSettingsDataStore.dismissedNextUpKeys.first()
+@@ -114,9 +117,9 @@ class AndroidTvChannelSyncService @Inject constructor(
+             ChannelSettingsSnapshot(daysCap, dismissed, useEpisodeThumbnails)
+         }
+ 
+-        val inProgressItems = runCatching { cwEnrichmentCache.getInProgressSnapshot() }
++        val inProgressItems = runCatching { cwEnrichmentCache.getInProgressSnapshot(profileId) }
+             .getOrDefault(emptyList())
+-        val nextUpItems = runCatching { cwEnrichmentCache.getNextUpSnapshot() }
++        val nextUpItems = runCatching { cwEnrichmentCache.getNextUpSnapshot(profileId) }
+             .getOrDefault(emptyList())
+ 
+         val posterPattern = patternForScreen(
+@@ -127,15 +130,20 @@ class AndroidTvChannelSyncService @Inject constructor(
+         val channelItems = buildChannelItems(inProgressItems, nextUpItems, resolvedSettings)
+             .withCustomPosterArt(posterPattern)
+ 
++        if (profileManager.activeProfileId.value != profileId) {
++            Log.d(TAG, "Profile switched during reconcile prep ($profileId -> ${profileManager.activeProfileId.value}); skipping stale publish")
++            return
++        }
++
+         Log.d(
+             TAG,
+-            "Reconciling from cache: ${channelItems.size} items " +
++            "Reconciling from cache (profile=$profileId): ${channelItems.size} items " +
+                 "(${inProgressItems.size} in-progress, ${nextUpItems.size} next-up raw)"
+         )
+-        manager.reconcile(channelItems)
++        manager.reconcile(channelItems, profileId)
+ 
+         runCatching {
+-            tvRecommendationManager.updateWatchNext(channelItems)
++            tvRecommendationManager.updateWatchNext(channelItems, profileId)
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/ContinueWatchingEnrichmentCache.kt b/app/src/main/java/com/nuvio/tv/data/local/ContinueWatchingEnrichmentCache.kt
+index cff649c..98ae1f3 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/ContinueWatchingEnrichmentCache.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/ContinueWatchingEnrichmentCache.kt
+@@ -95,17 +95,19 @@ class ContinueWatchingEnrichmentCache @Inject constructor(
+ 
+     // --- Next Up snapshot cache ---
+ 
+-    private fun nextUpFile(): File {
+-        val profileId = profileManager.activeProfileId.value
++    private fun nextUpFile(profileId: Int = profileManager.activeProfileId.value): File {
+         val dir = File(context.filesDir, "cw_enrichment")
+         dir.mkdirs()
+         return File(dir, "nextup_${profileId}.json")
+     }
+ 
+-    suspend fun getNextUpSnapshot(): List<CachedNextUpItem> = withContext(Dispatchers.IO) {
++    suspend fun getNextUpSnapshot(): List<CachedNextUpItem> =
++        getNextUpSnapshot(profileManager.activeProfileId.value)
++
++    suspend fun getNextUpSnapshot(profileId: Int): List<CachedNextUpItem> = withContext(Dispatchers.IO) {
+         mutex.withLock {
+             try {
+-                val file = nextUpFile()
++                val file = nextUpFile(profileId)
+                 if (!file.exists()) return@withContext emptyList()
+                 gson.fromJson(file.readText(), object : TypeToken<List<CachedNextUpItem>>() {}.type)
+                     ?: emptyList()
+@@ -141,17 +143,19 @@ class ContinueWatchingEnrichmentCache @Inject constructor(
+ 
+     // --- In-progress snapshot cache ---
+ 
+-    private fun inProgressFile(): File {
+-        val profileId = profileManager.activeProfileId.value
++    private fun inProgressFile(profileId: Int = profileManager.activeProfileId.value): File {
+         val dir = File(context.filesDir, "cw_enrichment")
+         dir.mkdirs()
+         return File(dir, "inprogress_${profileId}.json")
+     }
+ 
+-    suspend fun getInProgressSnapshot(): List<CachedInProgressItem> = withContext(Dispatchers.IO) {
++    suspend fun getInProgressSnapshot(): List<CachedInProgressItem> =
++        getInProgressSnapshot(profileManager.activeProfileId.value)
++
++    suspend fun getInProgressSnapshot(profileId: Int): List<CachedInProgressItem> = withContext(Dispatchers.IO) {
+         mutex.withLock {
+             try {
+-                val file = inProgressFile()
++                val file = inProgressFile(profileId)
+                 if (!file.exists()) return@withContext emptyList()
+                 gson.fromJson(file.readText(), object : TypeToken<List<CachedInProgressItem>>() {}.type)
+                     ?: emptyList()
 diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 index cf44453..799da54 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
@@ -589,3 +1023,30 @@ index 3d3eefb..1745d5d 100644
                          }
                          is NetworkResult.Error -> {
                              if (directAutoPlayFlowEnabledForSession) {
+diff --git a/app/src/test/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelManagerTest.kt b/app/src/test/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelManagerTest.kt
+index 830e1ff..4a95cd7 100644
+--- a/app/src/test/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelManagerTest.kt
++++ b/app/src/test/java/com/nuvio/tv/core/sync/androidtv/AndroidTvChannelManagerTest.kt
+@@ -174,6 +174,22 @@ class AndroidTvChannelManagerTest {
+         verify(exactly = 1) { contentResolver.delete(any(), null, null) }
+     }
+ 
++    @Test
++    fun `reconcile updates existing program when profileId changes even if content matches`() = runTest {
++        setupLeanback()
++        setupChannelExists()
++        stubProgramQuery(existingRows = mapOf("tt001" to 99L))
++
++        val progress = fakeProgress("tt001", "movie")
++        manager.reconcile(listOf(progress), profileId = 1)
++        // Same profileId skips redundant DB update
++        manager.reconcile(listOf(progress), profileId = 1)
++        // Switching profile invalidates fingerprint so intent URI gets updated with new profileId
++        manager.reconcile(listOf(progress), profileId = 3)
++
++        verify(exactly = 2) { contentResolver.update(any(), any(), null, null) }
++    }
++
+     // --- helpers ---
+ 
+     private fun setupLeanback() {

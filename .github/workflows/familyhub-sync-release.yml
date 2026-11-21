@@ -187,6 +187,7 @@ jobs:
           ./gradlew \
             :app:testFullReleaseUnitTest \
             --tests 'com.nuvio.tv.core.profile.ExternalProfileSwitchTest' \
+            --tests 'com.nuvio.tv.core.sync.androidtv.AndroidTvChannelManagerTest' \
             --tests 'com.nuvio.tv.updater.*' \
             :app:assembleFullRelease \
             --stacktrace
